@@ -50,6 +50,7 @@ impl ClientContextMenuOverlay {
                 source_pane_id,
                 has_manual_label,
                 right_click_passthrough,
+                pane_tabs_supported,
                 ..
             } => {
                 let mut items = vec![item("Rename pane", Action::RenamePane)];
@@ -62,6 +63,11 @@ impl ClientContextMenuOverlay {
                 items.extend([
                     item("Split right", Action::SplitRight),
                     item("Split down", Action::SplitDown),
+                ]);
+                if *pane_tabs_supported {
+                    items.push(item("New pane tab", Action::NewPaneTab));
+                }
+                items.extend([
                     item("Zoom", Action::Zoom),
                     item(
                         if *right_click_passthrough {
@@ -142,6 +148,16 @@ impl ClientShellState {
         }));
     }
 
+    /// Whether the active endpoint advertises `method`. Optional features stay
+    /// hidden on servers that cannot handle them.
+    pub(super) fn active_endpoint_advertises(&self, method: &str) -> bool {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
+            .and_then(|endpoint| endpoint.methods.as_ref())
+            .is_some_and(|methods| methods.iter().any(|advertised| advertised == method))
+    }
+
     pub(super) fn open_pane_context_menu(&mut self, pane_id: String, x: u16, y: u16) {
         let Some(snapshot) = self.snapshot.as_deref() else {
             return;
@@ -160,6 +176,7 @@ impl ClientShellState {
                 source_pane_id,
                 has_manual_label: pane.label.is_some(),
                 right_click_passthrough: pane.right_click_passthrough,
+                pane_tabs_supported: self.active_endpoint_advertises("pane.stack.create"),
             },
             x,
             y,
@@ -375,7 +392,8 @@ impl ClientShellState {
     ) {
         use crate::api::schema::{
             Method, PaneInputSetParams, PaneRenameParams, PaneRightClickTarget, PaneSplitParams,
-            PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams, SplitDirection,
+            PaneStackCreateParams, PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams,
+            SplitDirection,
         };
 
         match action {
@@ -438,6 +456,16 @@ impl ClientShellState {
                     outcome,
                 );
             }
+            ClientContextMenuAction::NewPaneTab => self.push_endpoint_method(
+                Method::PaneStackCreate(PaneStackCreateParams {
+                    workspace_id: Some(workspace_id),
+                    target_pane_id: Some(pane_id),
+                    cwd: None,
+                    focus: true,
+                    env: Default::default(),
+                }),
+                outcome,
+            ),
             ClientContextMenuAction::Zoom => self.push_endpoint_method(
                 Method::PaneZoom(PaneZoomParams {
                     pane_id: Some(pane_id),

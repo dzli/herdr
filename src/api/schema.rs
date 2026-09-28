@@ -141,6 +141,12 @@ pub enum Method {
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
+    #[serde(rename = "pane.stack.create")]
+    PaneStackCreate(PaneStackCreateParams),
+    #[serde(rename = "pane.stack.cycle")]
+    PaneStackCycle(PaneStackCycleParams),
+    #[serde(rename = "pane.stack.select_at")]
+    PaneStackSelectAt(PaneStackSelectAtParams),
     #[serde(rename = "pane.swap")]
     PaneSwap(PaneSwapParams),
     #[serde(rename = "pane.move")]

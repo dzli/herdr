@@ -426,6 +426,24 @@ impl ClientShellState {
         outcome
     }
 
+    /// A press on a pane's top border, where stacked panes draw their tab
+    /// strip. Only armed when the server can resolve the click to a tab.
+    fn pane_tab_press_at(&self, point: (u16, u16)) -> Option<ClientPaneTabPress> {
+        let hit = self.hits.panes.iter().find(|hit| {
+            !hit.popup
+                && hit.inner_rect.y > hit.rect.y
+                && point.1 == hit.rect.y
+                && point.0 > hit.rect.x
+                && point.0.saturating_add(1) < hit.rect.right()
+        })?;
+        self.active_endpoint_advertises("pane.stack.select_at")
+            .then(|| ClientPaneTabPress {
+                pane_id: hit.pane_id.clone(),
+                point,
+                column: point.0 - hit.rect.x,
+            })
+    }
+
     fn pane_split_target_is_current(&self, hit: &PaneSplitHit, tab_id: &str) -> Option<bool> {
         let snapshot = self.snapshot.as_deref()?;
         let surface = self.pane_surface.as_ref()?;
@@ -1226,6 +1244,19 @@ impl ClientShellState {
             }
         }
         if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+            if let Some(press) = self.pane_tab_press.take() {
+                if press.point == point {
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::PaneStackSelectAt(
+                            crate::api::schema::PaneStackSelectAtParams {
+                                pane_id: press.pane_id,
+                                column: press.column,
+                            },
+                        ),
+                        outcome,
+                    );
+                }
+            }
             if let Some(drag) = self.chrome_drag.take() {
                 self.workspace_press = None;
                 self.tab_press = None;
@@ -2168,6 +2199,7 @@ impl ClientShellState {
                     }
                     return;
                 }
+                self.pane_tab_press = self.pane_tab_press_at(point);
                 let split_hit = self
                     .hits
                     .pane_splits

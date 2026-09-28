@@ -34,6 +34,49 @@ pub struct PaneSplitParams {
     pub env: HashMap<String, String>,
 }
 
+/// Open a new shell pane as a pane tab stacked in the target pane's slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneStackCreateParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Focus the new pane tab. It is always shown when focused.
+    #[serde(default)]
+    pub focus: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+}
+
+/// Show the next or previous pane tab in a pane's stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneStackCycleParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub direction: PaneStackCycleDirection,
+}
+
+/// Show the pane tab whose label is at `column` of a stacked pane's top
+/// border. `column` is relative to the pane's left edge; a miss is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStackSelectAtParams {
+    pub pane_id: String,
+    pub column: u16,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStackCycleDirection {
+    #[default]
+    Next,
+    Previous,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInputSetParams {
     pub pane_id: String,

@@ -846,6 +846,55 @@ impl Workspace {
         Some(Ok((tab_idx, new_pane)))
     }
 
+    /// Add a shell pane as a new pane tab in `pane_id`'s stack. Returns None
+    /// when the pane is not in this workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stack_pane(
+        &mut self,
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: Option<PathBuf>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        extra_env: Vec<(String, String)>,
+        show: bool,
+        focus_new_pane: bool,
+    ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
+        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+        let pane_number = self.next_public_pane_number;
+        let tab_number = self.tabs[tab_idx].number;
+        let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
+        let new_pane = match self.tabs[tab_idx].stack_pane_shell(
+            pane_id,
+            show,
+            focus_new_pane,
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            &launch_env,
+        ) {
+            Ok(new_pane) => new_pane,
+            Err(err) => return Some(Err(err)),
+        };
+        self.register_new_pane_with_number(new_pane.pane_id, pane_number);
+        Some(Ok((tab_idx, new_pane)))
+    }
+
+    /// Show the next (or previous) pane tab in `pane_id`'s stack. Returns the
+    /// tab index and newly visible pane.
+    pub fn cycle_pane_stack(&mut self, pane_id: PaneId, forward: bool) -> Option<(usize, PaneId)> {
+        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+        let shown = self.tabs[tab_idx].layout.cycle_stack(pane_id, forward)?;
+        Some((tab_idx, shown))
+    }
+
     /// Close the focused pane. Returns true if the workspace should close.
     #[cfg(test)]
     pub fn close_focused(&mut self) -> bool {
@@ -1225,6 +1274,20 @@ impl Workspace {
         new_id
     }
 
+    /// Add a pane tab to the focused pane's stack without a PTY.
+    pub(crate) fn test_add_pane_tab(&mut self, show: bool) -> PaneId {
+        let tab = self.active_tab_mut().expect("workspace must have tab");
+        let target = tab.layout.focused();
+        let new_id = tab
+            .layout
+            .add_to_stack(target, show)
+            .expect("focused pane is in the layout");
+        tab.panes
+            .insert(new_id, PaneState::new(TerminalId::alloc()));
+        self.register_new_pane(new_id);
+        new_id
+    }
+
     pub(crate) fn test_add_tab(&mut self, name: Option<&str>) -> usize {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
@@ -1341,6 +1404,32 @@ impl Workspace {
                 tab_idx,
                 tab.layout.focused()
             );
+            assert!(
+                tab.layout.is_pane_visible(tab.layout.focused()),
+                "workspace {} tab {} focused pane {:?} is a hidden pane tab",
+                self.id,
+                tab_idx,
+                tab.layout.focused()
+            );
+            for stack in tab.layout.stacks() {
+                assert!(
+                    stack.len() >= 2,
+                    "workspace {} tab {} has a pane stack with fewer than two members",
+                    self.id,
+                    tab_idx
+                );
+                assert_eq!(
+                    stack
+                        .iter()
+                        .filter(|id| tab.layout.is_pane_visible(**id))
+                        .count(),
+                    1,
+                    "workspace {} tab {} pane stack {:?} must have exactly one visible member",
+                    self.id,
+                    tab_idx,
+                    stack
+                );
+            }
             let pane_set: std::collections::HashSet<_> = tab.panes.keys().copied().collect();
             assert_eq!(
                 layout_set, pane_set,

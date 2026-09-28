@@ -180,6 +180,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # cycle_pane_next = "prefix+tab"
 # cycle_pane_previous = "prefix+shift+tab"
 # last_pane = ""          # optional, unset by default; bind e.g. "prefix+tab" for global back-and-forth
+# new_pane_tab = "prefix+t"          # open a shell as a tab inside the focused pane
+# next_pane_tab = "prefix+period"
+# previous_pane_tab = "prefix+comma"
 # split_vertical = "prefix+v"
 # split_horizontal = "prefix+minus"
 # close_pane = "prefix+x"
@@ -305,6 +308,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 # Show detected/reported agent labels in split pane borders when no manual pane name is set.
 # show_agent_labels_on_pane_borders = false
+
+# Minimum width of each pane tab label in a pane's border (3-40 columns).
+# pane_tab_min_width = 5
 
 # Hide the tab row when a workspace has exactly one tab.
 # New tabs can still be created with the configured keybinding.

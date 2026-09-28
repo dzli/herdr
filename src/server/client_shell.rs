@@ -121,9 +121,12 @@ pub(super) fn snapshot_with_completions(
             }
         })
         .collect();
+    // Hidden pane tabs stay out of the client's pane list so pane cycling and
+    // navigation only reach visible panes; focusing one by id still reveals it.
     let panes = snapshot
         .panes
         .into_iter()
+        .filter(|pane| !pane_is_hidden_stack_member(app, &pane.pane_id))
         .map(|pane| {
             let pane_id = pane.pane_id;
             let focused = focused_pane_id.as_deref() == Some(pane_id.as_str());
@@ -623,6 +626,22 @@ fn split_hit_rect(
         return None;
     }
     Some(hit)
+}
+
+fn pane_is_hidden_stack_member(app: &app::App, public_pane_id: &str) -> bool {
+    let Some((workspace_index, pane_id)) = app.parse_pane_id(public_pane_id) else {
+        return false;
+    };
+    app.state
+        .workspaces
+        .get(workspace_index)
+        .and_then(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.panes.contains_key(&pane_id))
+        })
+        .is_some_and(|tab| !tab.layout.is_pane_visible(pane_id))
 }
 
 #[cfg(test)]

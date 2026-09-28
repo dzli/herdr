@@ -368,6 +368,9 @@ impl ClientShellState {
             crate::api::schema::Method::WorkspaceCreate(params) => params.focus,
             crate::api::schema::Method::TabCreate(params) => params.focus,
             crate::api::schema::Method::PaneSplit(params) => params.focus,
+            crate::api::schema::Method::PaneStackCreate(params) => params.focus,
+            crate::api::schema::Method::PaneStackCycle(_)
+            | crate::api::schema::Method::PaneStackSelectAt(_) => true,
             _ => false,
         };
         if changes_focus {
@@ -853,8 +856,9 @@ impl ClientShellState {
     ) -> Option<crate::api::schema::Method> {
         use crate::api::schema::{
             Method, PaneDirection, PaneFocusDirectionParams, PaneResizeParams, PaneSplitParams,
-            PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams, SplitDirection,
-            TabCreateParams, TabMoveParams, TabTarget, WorkspaceTarget,
+            PaneStackCreateParams, PaneStackCycleDirection, PaneStackCycleParams, PaneSwapParams,
+            PaneTarget, PaneZoomMode, PaneZoomParams, SplitDirection, TabCreateParams,
+            TabMoveParams, TabTarget, WorkspaceTarget,
         };
         use crate::input::KeybindAction;
 
@@ -1048,6 +1052,23 @@ impl ClientShellState {
                     focus: true,
                     right_click: Default::default(),
                     env: Default::default(),
+                }))
+            }
+            KeybindAction::NewPaneTab => Some(Method::PaneStackCreate(PaneStackCreateParams {
+                workspace_id: Some(focused_workspace),
+                target_pane_id: focused_pane,
+                cwd: None,
+                focus: true,
+                env: Default::default(),
+            })),
+            KeybindAction::NextPaneTab | KeybindAction::PreviousPaneTab => {
+                Some(Method::PaneStackCycle(PaneStackCycleParams {
+                    pane_id: focused_pane,
+                    direction: if action == KeybindAction::NextPaneTab {
+                        PaneStackCycleDirection::Next
+                    } else {
+                        PaneStackCycleDirection::Previous
+                    },
                 }))
             }
             KeybindAction::ClosePane => Some(Method::PaneClose(PaneTarget {

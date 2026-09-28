@@ -7,7 +7,6 @@ use ratatui::{
 };
 
 use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
-#[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
@@ -204,6 +203,39 @@ fn stable_scrollbar_gutter(
     (inner_rect, scrollbar_rect)
 }
 
+/// Give hidden pane tabs the geometry of their stack's visible member so a
+/// revealed pane tab never shows at a stale size. Unchanged sizes are no-ops.
+fn resize_hidden_stack_members(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    workspace_index: usize,
+    tab: &crate::workspace::Tab,
+    visible: crate::layout::PaneId,
+    pane_inner: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    let Some(stack) = tab.layout.pane_stack(visible) else {
+        return;
+    };
+    for &member in stack.iter().filter(|member| **member != visible) {
+        let Some((terminal_id, rt)) =
+            runtime_for_tab_pane(app, terminal_runtimes, workspace_index, tab, member)
+        else {
+            continue;
+        };
+        if app.direct_attach_resize_locks.contains(terminal_id) {
+            continue;
+        }
+        let inner_rect = terminal_inner_rect(rt, pane_inner, app.pane_scrollbars);
+        rt.resize(
+            inner_rect.height,
+            inner_rect.width,
+            cell_size.width_px,
+            cell_size.height_px,
+        );
+    }
+}
+
 /// Resize every visible runtime in a tab to the geometry it would receive if the tab were selected.
 pub(super) fn resize_tab_panes(
     app: &AppState,
@@ -235,6 +267,15 @@ pub(super) fn resize_tab_panes(
                     cell_size.height_px,
                 );
             }
+            resize_hidden_stack_members(
+                app,
+                terminal_runtimes,
+                workspace_index,
+                tab,
+                focused_id,
+                pane_inner,
+                cell_size,
+            );
         }
         return;
     }
@@ -260,6 +301,15 @@ pub(super) fn resize_tab_panes(
                 );
             }
         }
+        resize_hidden_stack_members(
+            app,
+            terminal_runtimes,
+            workspace_index,
+            tab,
+            info.id,
+            pane_inner,
+            cell_size,
+        );
     }
 }
 
@@ -309,6 +359,17 @@ pub(super) fn compute_pane_infos_for_tab(
                 );
             }
         }
+        if resize_panes {
+            resize_hidden_stack_members(
+                app,
+                terminal_runtimes,
+                ws_idx,
+                tab,
+                focused_id,
+                pane_inner,
+                cell_size,
+            );
+        }
         return vec![PaneInfo {
             id: focused_id,
             rect: area,
@@ -346,6 +407,17 @@ pub(super) fn compute_pane_infos_for_tab(
                     cell_size.height_px,
                 );
             }
+        }
+        if resize_panes {
+            resize_hidden_stack_members(
+                app,
+                terminal_runtimes,
+                ws_idx,
+                tab,
+                info.id,
+                pane_inner,
+                cell_size,
+            );
         }
 
         info.inner_rect = inner_rect;
@@ -644,6 +716,15 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
+        if let Some(stack) = ws
+            .tabs
+            .iter()
+            .find(|tab| tab.panes.contains_key(&info.id))
+            .and_then(|tab| tab.layout.pane_stack(info.id))
+        {
+            render_pane_stack_title(app, ws, stack, info, buf);
+            continue;
+        }
         let Some(title) = ws
             .pane_state(info.id)
             .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
@@ -682,6 +763,121 @@ fn render_pane_border_titles(
             end_x.saturating_sub(start_x) as usize,
             style,
         );
+    }
+}
+
+/// Longest label shown for one pane tab before truncation.
+const PANE_TAB_LABEL_MAX_WIDTH: usize = 16;
+
+/// Border cells kept between neighbouring pane tabs and after the last one.
+const PANE_TAB_GAP: u16 = 1;
+
+/// A pane tab label, centered in at least `min_width` columns so short labels
+/// still make a comfortable click target.
+fn pane_tab_label(index: usize, label: Option<&str>, min_width: u16) -> String {
+    let text = match label.map(str::trim).filter(|label| !label.is_empty()) {
+        Some(label) => format!(
+            " {}:{} ",
+            index + 1,
+            truncate_end(label, PANE_TAB_LABEL_MAX_WIDTH)
+        ),
+        None => format!(" {} ", index + 1),
+    };
+    let padding = usize::from(min_width).saturating_sub(display_width(&text));
+    let left = padding / 2;
+    format!("{}{text}{}", " ".repeat(left), " ".repeat(padding - left))
+}
+
+/// One pane tab label in a stacked pane's top border. Columns are relative to
+/// the pane's left edge; `end` is exclusive and already clipped to the border.
+pub(crate) struct PaneTabSpan {
+    pub pane_id: crate::layout::PaneId,
+    pub start: u16,
+    pub end: u16,
+    text: String,
+}
+
+/// Lay out the tab strip for `stack` in a pane `pane_width` columns wide. The
+/// strip is right-aligned in the top border, with a border cell between tabs
+/// and before the corner. When it does not fit it starts after the left corner
+/// and is clipped on the right. The renderer and click hit-testing share this
+/// so they cannot disagree.
+pub(crate) fn pane_stack_tab_spans(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+    stack: &[crate::layout::PaneId],
+    pane_width: u16,
+) -> Vec<PaneTabSpan> {
+    let labels: Vec<(crate::layout::PaneId, String, u16)> = stack
+        .iter()
+        .enumerate()
+        .map(|(index, &pane_id)| {
+            let label = ws
+                .pane_state(pane_id)
+                .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
+                .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders));
+            let text = pane_tab_label(index, label.as_deref(), app.pane_tab_min_width);
+            let width = u16::try_from(display_width(&text)).unwrap_or(u16::MAX);
+            (pane_id, text, width)
+        })
+        .collect();
+    let total = labels.iter().fold(0u16, |total, (_, _, width)| {
+        total.saturating_add(*width).saturating_add(PANE_TAB_GAP)
+    });
+    // Column 0 and `pane_width - 1` are the border corners.
+    let right = pane_width.saturating_sub(1);
+    let mut start = right.saturating_sub(total).max(1);
+    let mut spans = Vec::with_capacity(labels.len());
+    for (pane_id, text, width) in labels {
+        if start >= right {
+            break;
+        }
+        let end = start.saturating_add(width).min(right);
+        spans.push(PaneTabSpan {
+            pane_id,
+            start,
+            end,
+            text,
+        });
+        start = end.saturating_add(PANE_TAB_GAP);
+    }
+    spans
+}
+
+/// Draw a stacked pane's tab strip into its top border. The visible member is
+/// highlighted; hidden members are dimmed.
+fn render_pane_stack_title(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+    stack: &[crate::layout::PaneId],
+    info: &PaneInfo,
+    buf: &mut ratatui::buffer::Buffer,
+) {
+    let area = buf.area;
+    let y = info.rect.y;
+    if y < area.y || y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    let area_end = area.x.saturating_add(area.width);
+    for span in pane_stack_tab_spans(app, ws, stack, info.rect.width) {
+        let x = info.rect.x.saturating_add(span.start);
+        let end_x = info.rect.x.saturating_add(span.end).min(area_end);
+        if x >= end_x {
+            break;
+        }
+        let style = if span.pane_id == info.id {
+            let color = if info.is_focused {
+                app.palette.accent
+            } else {
+                app.palette.text
+            };
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        buf.set_stringn(x, y, &span.text, usize::from(end_x - x), style);
     }
 }
 
@@ -887,6 +1083,64 @@ mod tests {
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Saved directory is unavailable."));
         assert!(cursor.is_none_or(|cursor| !cursor.visible));
+    }
+
+    fn stacked_workspace() -> (AppState, Vec<crate::layout::PaneId>) {
+        let mut app = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("stack");
+        let root = workspace.tabs[0].root_pane;
+        let second = workspace.test_add_pane_tab(true);
+        let third = workspace.test_add_pane_tab(true);
+        app.workspaces.push(workspace);
+        app.ensure_test_terminals();
+        let stack = app.workspaces[0].tabs[0]
+            .layout
+            .pane_stack(root)
+            .unwrap()
+            .to_vec();
+        assert_eq!(stack, vec![root, second, third]);
+        (app, stack)
+    }
+
+    #[test]
+    fn pane_tab_spans_are_right_aligned_min_width_and_separated() {
+        let (mut app, stack) = stacked_workspace();
+        app.pane_tab_min_width = 10;
+
+        let spans = pane_stack_tab_spans(&app, &app.workspaces[0], &stack, 60);
+
+        assert_eq!(spans.len(), 3);
+        for span in &spans {
+            assert_eq!(span.end - span.start, 10);
+        }
+        assert_eq!(spans[1].start, spans[0].end + PANE_TAB_GAP);
+        assert_eq!(spans[2].start, spans[1].end + PANE_TAB_GAP);
+        // One border cell is left before the right corner at column 59.
+        assert_eq!(spans[2].end + PANE_TAB_GAP, 59);
+        assert_eq!(spans[0].text.trim(), "1");
+    }
+
+    #[test]
+    fn pane_tab_spans_start_after_left_corner_and_clip_when_too_narrow() {
+        let (mut app, stack) = stacked_workspace();
+        app.pane_tab_min_width = 10;
+
+        let spans = pane_stack_tab_spans(&app, &app.workspaces[0], &stack, 25);
+
+        assert_eq!(spans[0].start, 1);
+        assert!(spans.iter().all(|span| span.end <= 24));
+        assert!(spans.len() < 3 || spans[2].end - spans[2].start < 10);
+        assert!(pane_stack_tab_spans(&app, &app.workspaces[0], &stack, 2).is_empty());
+    }
+
+    #[test]
+    fn pane_tab_label_centers_short_labels_and_keeps_long_ones() {
+        assert_eq!(pane_tab_label(0, None, 9), "    1    ");
+        assert_eq!(pane_tab_label(1, Some("zsh"), 10), "  2:zsh   ");
+        assert_eq!(
+            pane_tab_label(2, Some("a-long-label"), 3),
+            " 3:a-long-label "
+        );
     }
 
     #[test]

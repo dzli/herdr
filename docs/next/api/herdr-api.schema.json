@@ -3262,6 +3262,83 @@
           ],
           "type": "object"
         },
+        "PaneStackCreateParams": {
+          "description": "Open a new shell pane as a pane tab stacked in the target pane's slot.",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "focus": {
+              "default": false,
+              "description": "Focus the new pane tab. It is always shown when focused.",
+              "type": "boolean"
+            },
+            "target_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "PaneStackCycleDirection": {
+          "enum": [
+            "next",
+            "previous"
+          ],
+          "type": "string"
+        },
+        "PaneStackCycleParams": {
+          "description": "Show the next or previous pane tab in a pane's stack.",
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/request/$defs/PaneStackCycleDirection",
+              "default": "next"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "PaneStackSelectAtParams": {
+          "description": "Show the pane tab whose label is at `column` of a stacked pane's top\nborder. `column` is relative to the pane's left edge; a miss is a no-op.",
+          "properties": {
+            "column": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "column"
+          ],
+          "type": "object"
+        },
         "PaneSwapParams": {
           "properties": {
             "direction": {
@@ -5441,6 +5518,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSplitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.stack.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneStackCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.stack.cycle",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneStackCycleParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.stack.select_at",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneStackSelectAtParams"
             }
           },
           "required": [

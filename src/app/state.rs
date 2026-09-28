@@ -835,6 +835,7 @@ pub struct AppState {
     pub pane_scrollbars: bool,
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    pub pane_tab_min_width: u16,
     pub tab_bar_right: Vec<TabBarStatusSegment>,
     pub tab_bar_right_separator: String,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
@@ -972,7 +973,7 @@ impl AppState {
         if tab.zoomed {
             tab.layout.focused() == pane_id
         } else {
-            tab.layout.pane_ids().contains(&pane_id)
+            tab.layout.is_pane_visible(pane_id)
         }
     }
 
@@ -1061,6 +1062,7 @@ impl AppState {
             pane_scrollbars: true,
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
+            pane_tab_min_width: crate::config::DEFAULT_PANE_TAB_MIN_WIDTH,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             reveal_hidden_cursor_for_cjk_ime: false,

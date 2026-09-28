@@ -191,6 +191,12 @@ pub(crate) fn keybind_help_groups(
                     "cycle pane previous",
                 ),
                 entry(binding_label(&keybinds.last_pane), "last pane"),
+                entry(binding_label(&keybinds.new_pane_tab), "new pane tab"),
+                entry(binding_label(&keybinds.next_pane_tab), "next pane tab"),
+                entry(
+                    binding_label(&keybinds.previous_pane_tab),
+                    "previous pane tab",
+                ),
             ],
         ),
     ];

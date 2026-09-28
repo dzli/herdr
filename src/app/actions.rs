@@ -379,9 +379,13 @@ impl AppState {
         if active_ws_idx != ws_idx {
             return false;
         }
-        self.workspaces[ws_idx]
-            .find_tab_index_for_pane(pane_id)
-            .is_some_and(|tab_idx| tab_idx == self.workspaces[ws_idx].active_tab)
+        let ws = &self.workspaces[ws_idx];
+        ws.find_tab_index_for_pane(pane_id)
+            .is_some_and(|tab_idx| tab_idx == ws.active_tab)
+            && ws
+                .tabs
+                .get(ws.active_tab)
+                .is_some_and(|tab| tab.layout.is_pane_visible(pane_id))
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
@@ -463,7 +467,11 @@ impl AppState {
         };
 
         let mut changed = false;
-        for pane in tab.panes.values_mut() {
+        let layout = &tab.layout;
+        for (pane_id, pane) in tab.panes.iter_mut() {
+            if !layout.is_pane_visible(*pane_id) {
+                continue;
+            }
             if !pane.seen {
                 pane.seen = true;
                 changed = true;
@@ -4504,6 +4512,96 @@ mod tests {
         state.close_pane();
 
         assert!(!state.terminals.contains_key(&terminal_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn closing_visible_pane_tab_reveals_sibling_and_keeps_workspace() {
+        let mut state = app_with_workspaces(&["test"]);
+        let original = state.workspaces[0].focused_pane_id().unwrap();
+        let pane_tab = state.workspaces[0].test_add_pane_tab(true);
+        state.ensure_test_terminals();
+        let terminal_id = state.terminal_id_for_pane(0, pane_tab).unwrap();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(pane_tab));
+
+        state.close_pane();
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(original));
+        assert!(state.workspaces[0].layout.pane_stack(original).is_none());
+        assert!(!state.terminals.contains_key(&terminal_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn hidden_pane_tab_exit_keeps_visible_pane_and_focus() {
+        let mut state = app_with_workspaces(&["test"]);
+        let original = state.workspaces[0].focused_pane_id().unwrap();
+        let hidden = state.workspaces[0].test_add_pane_tab(false);
+        state.ensure_test_terminals();
+        let terminal_id = state.terminal_id_for_pane(0, hidden).unwrap();
+
+        state.handle_pane_died(hidden);
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(original));
+        assert_eq!(state.workspaces[0].layout.pane_count(), 1);
+        assert!(!state.terminals.contains_key(&terminal_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn visible_pane_tab_exit_in_single_slot_reveals_sibling() {
+        let mut state = app_with_workspaces(&["test"]);
+        let original = state.workspaces[0].focused_pane_id().unwrap();
+        let pane_tab = state.workspaces[0].test_add_pane_tab(true);
+        state.ensure_test_terminals();
+
+        state.handle_pane_died(pane_tab);
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(original));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn hidden_pane_tab_counts_as_background_for_notifications_and_seen() {
+        let mut state = app_with_workspaces(&["test"]);
+        let original = state.workspaces[0].focused_pane_id().unwrap();
+        let hidden = state.workspaces[0].test_add_pane_tab(false);
+        state.ensure_test_terminals();
+        for pane_id in [original, hidden] {
+            state.workspaces[0].pane_state_mut(pane_id).unwrap().seen = false;
+        }
+
+        assert!(state.pane_is_in_active_tab(0, original));
+        assert!(!state.pane_is_in_active_tab(0, hidden));
+        assert!(state.mark_active_tab_seen());
+        assert!(state.workspaces[0].pane_state(original).unwrap().seen);
+        assert!(!state.workspaces[0].pane_state(hidden).unwrap().seen);
+
+        assert!(state.focus_pane_in_workspace(0, hidden));
+        assert!(state.pane_is_in_active_tab(0, hidden));
+        assert!(!state.pane_is_in_active_tab(0, original));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn pane_stacks_survive_adversarial_identity_state() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        let ws_idx = state.active.unwrap_or(0);
+        let tab_idx = state.workspaces[ws_idx].active_tab;
+        let hidden = state.workspaces[ws_idx].test_add_pane_tab(false);
+        let shown = state.workspaces[ws_idx].test_add_pane_tab(true);
+        state.ensure_test_terminals();
+        state.assert_invariants_for_test();
+
+        assert_eq!(
+            state.workspaces[ws_idx].cycle_pane_stack(shown, true),
+            Some((tab_idx, hidden))
+        );
+        state.assert_invariants_for_test();
+        state.close_pane();
         state.assert_invariants_for_test();
     }
 

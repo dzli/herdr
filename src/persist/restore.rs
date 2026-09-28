@@ -126,7 +126,7 @@ pub fn handoff_pane_aliases(
     let mut aliases = HashMap::new();
     for (ws_snap, workspace) in snapshot.workspaces.iter().zip(workspaces) {
         for (tab_snap, tab) in ws_snap.tabs.iter().zip(&workspace.tabs) {
-            let old_ids = collect_snapshot_pane_ids(&tab_snap.layout);
+            let old_ids = snapshot_pane_ids_with_stacks(tab_snap);
             let new_ids = tab.layout.pane_ids();
             for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
                 if old_id != new_id.raw() {
@@ -142,6 +142,20 @@ pub fn handoff_pane_aliases(
 fn collect_snapshot_pane_ids(node: &LayoutSnapshot) -> Vec<u32> {
     let mut ids = Vec::new();
     collect_snapshot_ids_inner(node, &mut ids);
+    ids
+}
+
+/// Saved pane ids in `TileLayout::pane_ids` order: each leaf contributes its
+/// pane stack members in tab order.
+#[cfg(unix)]
+fn snapshot_pane_ids_with_stacks(tab: &TabSnapshot) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for leaf in collect_snapshot_pane_ids(&tab.layout) {
+        match tab.pane_stacks.iter().find(|stack| stack.contains(&leaf)) {
+            Some(stack) => ids.extend_from_slice(stack),
+            None => ids.push(leaf),
+        }
+    }
     ids
 }
 
@@ -164,6 +178,11 @@ fn migrated_public_pane_numbers_by_old_raw(
     for tab in &snap.tabs {
         let mut pane_ids = Vec::new();
         collect_layout_snapshot_pane_ids(&tab.layout, &mut pane_ids);
+        for old_raw in tab.pane_stacks.iter().flatten() {
+            if !pane_ids.contains(old_raw) {
+                pane_ids.push(*old_raw);
+            }
+        }
         for old_raw in pane_ids {
             public_numbers.entry(old_raw).or_insert_with(|| {
                 let number = *next_public_pane_number;
@@ -495,12 +514,20 @@ fn restore_tab(
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
 ) -> RestoreFailures<Option<RestoredTab>> {
-    let (node, id_map) = restore_node_remapped(&snap.layout);
+    let (node, mut id_map) = restore_node_remapped(&snap.layout);
+    let mut pane_ids = collect_pane_ids(&node);
+    // Hidden pane tab members are not layout leaves; give them fresh ids too.
+    for old_id in snap.pane_stacks.iter().flatten() {
+        if !id_map.contains_key(old_id) {
+            let new_id = PaneId::alloc();
+            id_map.insert(*old_id, new_id);
+            pane_ids.push(new_id);
+        }
+    }
     let reverse_id_map: HashMap<PaneId, u32> = id_map
         .iter()
         .map(|(&old_id, &new_id)| (new_id, old_id))
         .collect();
-    let pane_ids = collect_pane_ids(&node);
 
     let mut panes = HashMap::new();
     let mut terminals = Vec::new();
@@ -765,6 +792,7 @@ fn restore_tab(
     }
 
     let surviving: HashSet<PaneId> = panes.keys().copied().collect();
+    let (node, stacks) = restored_pane_stacks(node, &snap.pane_stacks, &id_map, &surviving);
     let Some(node) = prune_restored_node(node, &surviving) else {
         warn!(
             tab = ?snap.custom_name,
@@ -780,7 +808,9 @@ fn restore_tab(
     else {
         return (None, failed_imports);
     };
-    let layout = TileLayout::from_saved(node, focus);
+    let mut layout = TileLayout::from_saved_with_stacks(node, focus, stacks);
+    // Saved focus is always a visible pane; reveal it if a lost leaf changed that.
+    layout.focus_pane(focus);
 
     (
         Some((
@@ -913,6 +943,54 @@ fn take_restore_plan_for_snapshot(
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     restore_plan_for_snapshot(session, resume_agents_on_restore)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
+}
+
+/// Map saved pane stacks onto restored ids, dropping members that failed to
+/// restore. When a stack's visible leaf was lost, its first surviving member
+/// takes over the leaf so the slot is not pruned.
+fn restored_pane_stacks(
+    mut node: Node,
+    saved: &[Vec<u32>],
+    id_map: &HashMap<u32, PaneId>,
+    surviving: &HashSet<PaneId>,
+) -> (Node, Vec<Vec<PaneId>>) {
+    let leaves: HashSet<PaneId> = collect_pane_ids(&node).into_iter().collect();
+    let mut stacks = Vec::new();
+    for saved_stack in saved {
+        let mapped: Vec<PaneId> = saved_stack
+            .iter()
+            .filter_map(|old_id| id_map.get(old_id).copied())
+            .collect();
+        let Some(&leaf) = mapped.iter().find(|id| leaves.contains(id)) else {
+            continue;
+        };
+        let members: Vec<PaneId> = mapped
+            .into_iter()
+            .filter(|id| surviving.contains(id))
+            .collect();
+        if !surviving.contains(&leaf) {
+            if let Some(&replacement) = members.first() {
+                replace_restored_leaf(&mut node, leaf, replacement);
+            }
+        }
+        if members.len() >= 2 {
+            stacks.push(members);
+        }
+    }
+    (node, stacks)
+}
+
+fn replace_restored_leaf(node: &mut Node, old: PaneId, new: PaneId) -> bool {
+    match node {
+        Node::Pane(id) if *id == old => {
+            *id = new;
+            true
+        }
+        Node::Pane(_) => false,
+        Node::Split { first, second, .. } => {
+            replace_restored_leaf(first, old, new) || replace_restored_leaf(second, old, new)
+        }
+    }
 }
 
 pub(super) fn prune_restored_node(node: Node, surviving: &HashSet<PaneId>) -> Option<Node> {
@@ -1457,6 +1535,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1538,6 +1617,7 @@ mod tests {
                 public_tab_numbers: vec![5],
                 next_public_tab_number: 6,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: super::super::snapshot::DirectionSnapshot::Horizontal,
@@ -1609,6 +1689,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_rebuilds_pane_stacks_with_hidden_members() {
+        let cwd = std::env::current_dir().unwrap();
+        let pane_snap = |label: &str| super::super::snapshot::PaneSnapshot {
+            cwd: cwd.clone(),
+            label: Some(label.into()),
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            agent_resume: None,
+            launch_argv: None,
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::from([(10, 1), (20, 2), (30, 3)]),
+                next_public_pane_number: 4,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    pane_stacks: vec![vec![10, 30]],
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(30)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([
+                        (10, pane_snap("vim")),
+                        (20, pane_snap("agent")),
+                        (30, pane_snap("shell")),
+                    ]),
+                    zoomed: false,
+                    focused: Some(30),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("workspace should restore");
+        workspace.assert_invariants_for_test();
+        let tab = &workspace.tabs[0];
+        let label_of = |pane_id: PaneId| {
+            tab.terminal_id(pane_id)
+                .and_then(|terminal_id| terminals.get(terminal_id))
+                .and_then(|terminal| terminal.manual_label.clone())
+        };
+        assert_eq!(tab.layout.pane_count(), 3);
+        let stack = tab
+            .layout
+            .pane_stack(tab.layout.focused())
+            .expect("stack restored");
+        let labels: Vec<_> = stack.iter().map(|id| label_of(*id)).collect();
+        assert_eq!(labels, vec![Some("vim".into()), Some("shell".into())]);
+        assert_eq!(label_of(tab.layout.focused()).as_deref(), Some("shell"));
+        assert_eq!(label_of(tab.root_pane).as_deref(), Some("vim"));
+        assert!(!tab.layout.is_pane_visible(tab.root_pane));
+        let mut public_numbers: Vec<_> = workspace.public_pane_numbers.values().copied().collect();
+        public_numbers.sort_unstable();
+        assert_eq!(public_numbers, vec![1, 2, 3]);
+
+        let recaptured = super::super::snapshot::capture_workspace(
+            workspace,
+            &terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+        );
+        assert_eq!(recaptured.tabs[0].pane_stacks.len(), 1);
+        assert_eq!(recaptured.tabs[0].pane_stacks[0].len(), 2);
+    }
+
+    #[tokio::test]
     async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
         let pane_snap = |id: &str| {
@@ -1652,6 +1828,7 @@ mod tests {
                 next_public_tab_number: 6,
                 tabs: vec![
                     TabSnapshot {
+                        pane_stacks: Vec::new(),
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(10),
                         panes: HashMap::from([pane_snap("10")]),
@@ -1660,6 +1837,7 @@ mod tests {
                         root_pane: Some(10),
                     },
                     TabSnapshot {
+                        pane_stacks: Vec::new(),
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(11),
                         panes: HashMap::from([pane_snap("11")]),
@@ -1668,6 +1846,7 @@ mod tests {
                         root_pane: Some(11),
                     },
                     TabSnapshot {
+                        pane_stacks: Vec::new(),
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(12),
                         panes: HashMap::from([pane_snap("12")]),
@@ -1676,6 +1855,7 @@ mod tests {
                         root_pane: Some(12),
                     },
                     TabSnapshot {
+                        pane_stacks: Vec::new(),
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(13),
                         panes: HashMap::from([(13, final_pane)]),
@@ -1734,6 +1914,7 @@ mod tests {
             public_tab_numbers: Vec::new(),
             next_public_tab_number: 0,
             tabs: vec![TabSnapshot {
+                pane_stacks: Vec::new(),
                 custom_name: None,
                 layout: LayoutSnapshot::Split {
                     direction: super::super::snapshot::DirectionSnapshot::Horizontal,
@@ -1773,6 +1954,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -2129,6 +2311,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,

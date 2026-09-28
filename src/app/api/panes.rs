@@ -12,7 +12,8 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
+    PaneSendTextParams, PaneSplitParams, PaneStackCreateParams, PaneStackCycleDirection,
+    PaneStackCycleParams, PaneStackSelectAtParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
     PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
     PaneZoomResult, ResponseResult,
 };
@@ -132,6 +133,190 @@ impl App {
         self.emit_layout_updated_event(ws_idx, target_tab_idx);
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_stack_create(
+        &mut self,
+        id: String,
+        params: PaneStackCreateParams,
+    ) -> String {
+        let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
+            self.parse_pane_id(target_pane_id)
+        } else if let Some(workspace_id) = params.workspace_id.as_deref() {
+            self.parse_workspace_id(workspace_id).and_then(|ws_idx| {
+                let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
+                Some((ws_idx, pane_id))
+            })
+        } else {
+            self.resolve_optional_pane(None)
+        };
+        let Some((ws_idx, target_pane_id)) = target else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let extra_env = match super::env::normalize_launch_env(params.env) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        // The new pane tab takes over the target's slot, so it starts at the
+        // target's size rather than an estimate.
+        let (rows, cols) = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, target_pane_id)
+            .map(|runtime| runtime.current_size())
+            .unwrap_or_else(|| self.state.estimate_pane_size());
+        let stack_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
+            let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
+            Some(self.resolve_new_terminal_cwd(follow_cwd))
+        });
+        let default_shell = self.state.default_shell.clone();
+        let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
+        let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
+        let previous_focus = self.state.current_pane_focus_target();
+        let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
+        let (target_tab_idx, new_pane) = match ws.stack_pane(
+            target_pane_id,
+            rows,
+            cols,
+            stack_cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            extra_env,
+            params.focus,
+            params.focus,
+        ) {
+            Some(Ok(result)) => result,
+            Some(Err(err)) => return encode_error(id, "pane_stack_create_failed", err.to_string()),
+            None => return encode_error(id, "pane_not_found", "pane not found"),
+        };
+        if params.focus {
+            self.state.switch_workspace_tab(ws_idx, target_tab_idx);
+            self.state
+                .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
+            self.state.mode = crate::app::Mode::Terminal;
+        }
+        self.terminal_runtimes
+            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.state
+            .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
+        self.state
+            .terminals
+            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        self.schedule_session_save();
+        let Some(pane) = self.pane_info(ws_idx, new_pane.pane_id) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        self.emit_event(EventEnvelope {
+            event: EventKind::PaneCreated,
+            data: EventData::PaneCreated { pane: pane.clone() },
+        });
+        self.emit_layout_updated_event(ws_idx, target_tab_idx);
+
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_stack_cycle(
+        &mut self,
+        id: String,
+        params: PaneStackCycleParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let forward = params.direction == PaneStackCycleDirection::Next;
+        let previous_focus = self.state.current_pane_focus_target();
+        let shown = self.state.workspaces[ws_idx].cycle_pane_stack(pane_id, forward);
+        let result_pane = match shown {
+            Some((tab_idx, shown)) => {
+                let focused = self.state.workspaces[ws_idx]
+                    .tabs
+                    .get(tab_idx)
+                    .is_some_and(|tab| tab.layout.focused() == shown);
+                if focused {
+                    self.state
+                        .record_pane_focus_change(previous_focus, ws_idx, shown);
+                }
+                self.state.mark_active_tab_seen();
+                self.state.mark_session_dirty();
+                self.schedule_session_save();
+                self.emit_layout_updated_event(ws_idx, tab_idx);
+                shown
+            }
+            None => pane_id,
+        };
+        let Some(pane) = self.pane_info(ws_idx, result_pane) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_stack_select_at(
+        &mut self,
+        id: String,
+        params: PaneStackSelectAtParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(tab_idx) = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let target = self.pane_stack_tab_at_column(ws_idx, tab_idx, pane_id, params.column);
+        let result_pane = match target {
+            Some(target) => {
+                if self.state.focus_pane_in_workspace(ws_idx, target) {
+                    self.state.mark_active_tab_seen();
+                    self.schedule_session_save();
+                    self.emit_layout_updated_event(ws_idx, tab_idx);
+                }
+                self.state.mode = crate::app::Mode::Terminal;
+                target
+            }
+            None => pane_id,
+        };
+        let Some(pane) = self.pane_info(ws_idx, result_pane) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    /// The pane tab whose border label covers `column` of `pane_id`'s slot, as
+    /// laid out by the renderer for the server's canonical view geometry.
+    fn pane_stack_tab_at_column(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        pane_id: PaneId,
+        column: u16,
+    ) -> Option<PaneId> {
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let tab = ws.tabs.get(tab_idx)?;
+        let visible = tab.layout.visible_pane_for(pane_id)?;
+        let stack = tab.layout.pane_stack(visible)?;
+        let area = self.state.view.terminal_area;
+        let width = if tab.zoomed {
+            (tab.layout.focused() == visible).then_some(area.width)?
+        } else {
+            crate::ui::apply_pane_chrome(
+                tab.layout.panes(area),
+                self.state.pane_borders,
+                self.state.pane_gaps,
+                self.state.pane_outer_borders,
+            )
+            .into_iter()
+            .find(|info| info.id == visible)?
+            .rect
+            .width
+        };
+        crate::ui::pane_stack_tab_spans(&self.state, ws, stack, width)
+            .into_iter()
+            .find(|span| column >= span.start && column < span.end)
+            .map(|span| span.pane_id)
     }
 
     pub(super) fn handle_pane_list(&mut self, id: String, params: PaneListParams) -> String {
@@ -3901,6 +4086,140 @@ mod tests {
             EventData::LayoutUpdated { layout }
                 if layout.tab_id == app.public_tab_id(0, 0).unwrap() && !layout.zoomed
         ));
+    }
+
+    fn app_with_stacked_left_pane() -> (App, PaneId, PaneId) {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 20);
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let _right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces[0].tabs[0].layout.focus_pane(root);
+        let hidden = app.state.workspaces[0].test_add_pane_tab(false);
+        app.state.ensure_test_terminals();
+        (app, root, hidden)
+    }
+
+    fn stacked_left_pane_tab_spans(app: &App, visible: PaneId) -> Vec<crate::ui::PaneTabSpan> {
+        let ws = &app.state.workspaces[0];
+        let tab = &ws.tabs[0];
+        let width = crate::ui::apply_pane_chrome(
+            tab.layout.panes(app.state.view.terminal_area),
+            app.state.pane_borders,
+            app.state.pane_gaps,
+            app.state.pane_outer_borders,
+        )
+        .into_iter()
+        .find(|info| info.id == visible)
+        .unwrap()
+        .rect
+        .width;
+        let stack = tab.layout.pane_stack(visible).unwrap();
+        crate::ui::pane_stack_tab_spans(&app.state, ws, stack, width)
+    }
+
+    #[test]
+    fn api_pane_stack_select_at_reveals_clicked_tab() {
+        let (mut app, root, hidden) = app_with_stacked_left_pane();
+        let root_public = app.public_pane_id(0, root).unwrap();
+        let hidden_public = app.public_pane_id(0, hidden).unwrap();
+
+        let spans = stacked_left_pane_tab_spans(&app, root);
+        assert_eq!(spans.len(), 2);
+        let second_tab = spans[1].start + 1;
+        let response = app.handle_pane_stack_select_at(
+            "req".into(),
+            PaneStackSelectAtParams {
+                pane_id: root_public.clone(),
+                column: second_tab,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.pane_id, hidden_public);
+        let layout = &app.state.workspaces[0].tabs[0].layout;
+        assert_eq!(layout.focused(), hidden);
+        assert!(layout.is_pane_visible(hidden));
+        assert!(!layout.is_pane_visible(root));
+        app.state.assert_invariants_for_test();
+
+        // Clicking the first label from the now-visible member switches back.
+        app.handle_pane_stack_select_at(
+            "req".into(),
+            PaneStackSelectAtParams {
+                pane_id: hidden_public,
+                column: spans[0].end - 1,
+            },
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), root);
+    }
+
+    #[test]
+    fn api_pane_stack_select_at_ignores_clicks_outside_labels() {
+        let (mut app, root, hidden) = app_with_stacked_left_pane();
+        let root_public = app.public_pane_id(0, root).unwrap();
+        let spans = stacked_left_pane_tab_spans(&app, root);
+        // Left corner, empty border before the strip, and the gap between tabs.
+        let misses = [0, spans[0].start - 1, spans[0].end];
+        assert!(spans[0].end < spans[1].start);
+
+        for column in misses {
+            let response = app.handle_pane_stack_select_at(
+                "req".into(),
+                PaneStackSelectAtParams {
+                    pane_id: root_public.clone(),
+                    column,
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::PaneInfo { pane } = success.result else {
+                panic!("expected pane info response");
+            };
+            assert_eq!(pane.pane_id, root_public);
+        }
+        let layout = &app.state.workspaces[0].tabs[0].layout;
+        assert_eq!(layout.focused(), root);
+        assert!(!layout.is_pane_visible(hidden));
+    }
+
+    #[test]
+    fn api_pane_stack_cycle_shows_next_tab_and_noops_without_stack() {
+        let (mut app, root, hidden) = app_with_stacked_left_pane();
+        let hidden_public = app.public_pane_id(0, hidden).unwrap();
+
+        let response = app.handle_pane_stack_cycle("req".into(), PaneStackCycleParams::default());
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.pane_id, hidden_public);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), hidden);
+
+        let right = app.state.workspaces[0].tabs[0]
+            .layout
+            .visible_pane_ids()
+            .into_iter()
+            .find(|id| *id != hidden)
+            .unwrap();
+        let right_public = app.public_pane_id(0, right).unwrap();
+        let response = app.handle_pane_stack_cycle(
+            "req".into(),
+            PaneStackCycleParams {
+                pane_id: Some(right_public.clone()),
+                direction: PaneStackCycleDirection::Previous,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.pane_id, right_public);
+        assert!(!app.state.workspaces[0].tabs[0].layout.is_pane_visible(root));
     }
 
     #[test]

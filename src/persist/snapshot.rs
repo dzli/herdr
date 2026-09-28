@@ -94,6 +94,10 @@ pub struct TabSnapshot {
     pub focused: Option<u32>,
     #[serde(default)]
     pub root_pane: Option<u32>,
+    /// Pane tab stacks in tab order. Each stack contains exactly one layout
+    /// leaf; the other members are hidden panes listed in `panes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pane_stacks: Vec<Vec<u32>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,6 +160,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
     fn from(snap: LegacyWorkspaceSnapshot) -> Self {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
+            pane_stacks: Vec::new(),
             custom_name: None,
             layout: snap.layout,
             panes: snap.panes,
@@ -284,7 +289,7 @@ pub fn capture(
     }
 }
 
-fn capture_workspace(
+pub(super) fn capture_workspace(
     ws: &Workspace,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
@@ -398,6 +403,12 @@ fn capture_tab(
         zoomed: tab.zoomed,
         focused: Some(tab.layout.focused().raw()),
         root_pane: Some(tab.root_pane.raw()),
+        pane_stacks: tab
+            .layout
+            .stacks()
+            .iter()
+            .map(|stack| stack.iter().map(|id| id.raw()).collect())
+            .collect(),
     }
 }
 
@@ -733,6 +744,7 @@ mod tests {
                 public_tab_numbers: vec![1],
                 next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -1434,6 +1446,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    pane_stacks: Vec::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,

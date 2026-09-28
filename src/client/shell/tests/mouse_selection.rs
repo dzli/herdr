@@ -1159,3 +1159,150 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
     assert!(outside.repaint);
     assert!(state.overlay.is_none());
 }
+
+fn bordered_pane_surface() -> PaneSurfaceFrame {
+    let mut pane_surface = surface();
+    let buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 10));
+    pane_surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+    pane_surface.panes[0].rect = SurfaceRect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 10,
+    };
+    pane_surface.panes[0].inner_rect = SurfaceRect {
+        x: 1,
+        y: 1,
+        width: 38,
+        height: 8,
+    };
+    pane_surface
+}
+
+fn pane_tab_click(
+    state: &mut ClientShellState,
+    press: (u16, u16),
+    release: (u16, u16),
+) -> Vec<crate::api::schema::Method> {
+    let mut methods = Vec::new();
+    for (kind, (column, row)) in [
+        (MouseEventKind::Down(MouseButton::Left), press),
+        (MouseEventKind::Up(MouseButton::Left), release),
+    ] {
+        let outcome =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        methods.extend(
+            outcome
+                .actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    ClientShellAction::Endpoint { request, .. } => Some(request.method),
+                    _ => None,
+                }),
+        );
+    }
+    methods
+}
+
+fn pane_tab_state(methods: Vec<String>) -> (ClientShellState, ratatui::layout::Rect) {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_endpoint_methods(Some(methods));
+    state.set_pane_surface(bordered_pane_surface());
+    state.compose(106, 20).expect("bordered pane surface");
+    let rect = state.hits.panes[0].rect;
+    (state, rect)
+}
+
+#[test]
+fn pane_top_border_click_selects_pane_tab_at_column() {
+    let (mut state, rect) = pane_tab_state(vec!["pane.stack.select_at".into()]);
+    let point = (rect.x + 5, rect.y);
+
+    let methods = pane_tab_click(&mut state, point, point);
+
+    assert!(methods.iter().any(|method| matches!(
+        method,
+        crate::api::schema::Method::PaneStackSelectAt(params)
+            if params.pane_id == "pane_1" && params.column == 5
+    )));
+}
+
+#[test]
+fn pane_top_border_drag_or_unadvertised_method_does_not_select_pane_tab() {
+    let is_select = |method: &crate::api::schema::Method| {
+        matches!(method, crate::api::schema::Method::PaneStackSelectAt(_))
+    };
+
+    let (mut state, rect) = pane_tab_state(vec!["pane.stack.select_at".into()]);
+    let methods = pane_tab_click(&mut state, (rect.x + 5, rect.y), (rect.x + 9, rect.y));
+    assert!(!methods.iter().any(is_select));
+
+    let (mut state, rect) = pane_tab_state(vec!["pane.stack.select_at".into()]);
+    let methods = pane_tab_click(
+        &mut state,
+        (rect.x + 5, rect.y + 3),
+        (rect.x + 5, rect.y + 3),
+    );
+    assert!(!methods.iter().any(is_select));
+
+    let (mut state, rect) = pane_tab_state(Vec::new());
+    let methods = pane_tab_click(&mut state, (rect.x + 5, rect.y), (rect.x + 5, rect.y));
+    assert!(!methods.iter().any(is_select));
+}
+
+fn pane_menu_action_index(
+    state: &ClientShellState,
+    action: ClientContextMenuAction,
+) -> Option<usize> {
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => {
+            menu.items().iter().position(|item| item.action == action)
+        }
+        _ => panic!("pane context menu"),
+    }
+}
+
+#[test]
+fn pane_context_menu_new_pane_tab_creates_focused_pane_tab() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_endpoint_methods(Some(vec!["pane.stack.create".into()]));
+    state.open_pane_context_menu("pane_1".into(), 0, 0);
+    let index = pane_menu_action_index(&state, ClientContextMenuAction::NewPaneTab)
+        .expect("new pane tab menu item");
+
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(index, &mut outcome);
+
+    assert!(outcome.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(
+                &request.method,
+                crate::api::schema::Method::PaneStackCreate(params)
+                    if params.target_pane_id.as_deref() == Some("pane_1")
+                        && params.workspace_id.as_deref() == Some("ws_1")
+                        && params.focus
+            )
+    )));
+}
+
+#[test]
+fn pane_context_menu_hides_new_pane_tab_when_server_lacks_it() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_endpoint_methods(Some(Vec::new()));
+    state.open_pane_context_menu("pane_1".into(), 0, 0);
+
+    assert_eq!(
+        pane_menu_action_index(&state, ClientContextMenuAction::NewPaneTab),
+        None
+    );
+    assert!(pane_menu_action_index(&state, ClientContextMenuAction::SplitRight).is_some());
+}

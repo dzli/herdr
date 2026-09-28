@@ -35,6 +35,18 @@ enum SplitCommand<'a> {
     },
 }
 
+/// Where a newly spawned pane goes relative to its target.
+#[derive(Clone, Copy)]
+enum NewPanePlacement {
+    Split {
+        direction: Direction,
+        ratio: Option<f32>,
+    },
+    /// Add as a pane tab in the target's stack. `show` makes it the visible
+    /// member.
+    Stack { show: bool },
+}
+
 pub struct Tab {
     pub custom_name: Option<String>,
     pub number: usize,
@@ -217,11 +229,13 @@ impl Tab {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
     ) -> std::io::Result<NewPane> {
-        self.split_pane_with_runtime(
+        self.spawn_pane_with_runtime(
             self.layout.focused(),
             true,
-            direction,
-            None,
+            NewPanePlacement::Split {
+                direction,
+                ratio: None,
+            },
             rows,
             cols,
             cwd,
@@ -256,11 +270,10 @@ impl Tab {
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &PaneLaunchEnv,
     ) -> std::io::Result<NewPane> {
-        self.split_pane_with_runtime(
+        self.spawn_pane_with_runtime(
             target,
             focus_new_pane,
-            direction,
-            ratio,
+            NewPanePlacement::Split { direction, ratio },
             rows,
             cols,
             cwd,
@@ -291,11 +304,10 @@ impl Tab {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
     ) -> std::io::Result<NewPane> {
-        self.split_pane_with_runtime(
+        self.spawn_pane_with_runtime(
             target,
             focus_new_pane,
-            direction,
-            ratio,
+            NewPanePlacement::Split { direction, ratio },
             rows,
             cols,
             cwd,
@@ -308,14 +320,49 @@ impl Tab {
         )
     }
 
-    // Split construction threads geometry, host context, launch policy, and command state.
+    /// Add a shell pane as a new pane tab in `target`'s stack. The new pane is
+    /// shown when `show` is set; focus moves to it only when `focus_new_pane`
+    /// is set. A spawn failure restores the stack's previously visible member.
     #[allow(clippy::too_many_arguments)]
-    fn split_pane_with_runtime(
+    pub(crate) fn stack_pane_shell(
+        &mut self,
+        target: PaneId,
+        show: bool,
+        focus_new_pane: bool,
+        rows: u16,
+        cols: u16,
+        cwd: Option<PathBuf>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        launch_env: &PaneLaunchEnv,
+    ) -> std::io::Result<NewPane> {
+        self.spawn_pane_with_runtime(
+            target,
+            focus_new_pane,
+            NewPanePlacement::Stack {
+                show: show || focus_new_pane,
+            },
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            launch_env,
+            None,
+        )
+    }
+
+    // Pane construction threads geometry, host context, launch policy, and command state.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_pane_with_runtime(
         &mut self,
         target: PaneId,
         focus_new_pane: bool,
-        direction: Direction,
-        ratio: Option<f32>,
+        placement: NewPanePlacement,
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
@@ -326,13 +373,18 @@ impl Tab {
         launch_env: &PaneLaunchEnv,
         command: Option<SplitCommand<'_>>,
     ) -> std::io::Result<NewPane> {
-        let Some(new_id) = self
-            .layout
-            .split_pane(target, direction, ratio.unwrap_or(0.5))
-        else {
+        let previously_visible = self.layout.visible_pane_for(target);
+        let new_id = match placement {
+            NewPanePlacement::Split { direction, ratio } => {
+                self.layout
+                    .split_pane(target, direction, ratio.unwrap_or(0.5))
+            }
+            NewPanePlacement::Stack { show } => self.layout.add_to_stack(target, show),
+        };
+        let Some(new_id) = new_id else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "split target pane is not in the layout",
+                "target pane is not in the layout",
             ));
         };
         let actual_cwd =
@@ -395,6 +447,9 @@ impl Tab {
             Ok(runtime) => runtime,
             Err(err) => {
                 self.layout.close_pane(new_id);
+                if let Some(previous) = previously_visible {
+                    self.layout.select_stack_pane(previous);
+                }
                 return Err(err);
             }
         };
@@ -409,7 +464,10 @@ impl Tab {
             self.layout.focus_pane(new_id);
         }
         self.panes.insert(new_id, PaneState::new(terminal_id));
-        self.zoomed = false;
+        // A new pane tab takes over its leaf, so zoom can stay on it.
+        if matches!(placement, NewPanePlacement::Split { .. }) {
+            self.zoomed = false;
+        }
         Ok(NewPane {
             pane_id: new_id,
             terminal,

@@ -434,6 +434,12 @@ pub struct KeysConfig {
     pub cycle_pane_previous: BindingConfig,
     /// Focus the last focused pane across workspaces and tabs. Unset by default.
     pub last_pane: BindingConfig,
+    /// Open a new shell as a pane tab in the focused pane. Default: "prefix+t".
+    pub new_pane_tab: BindingConfig,
+    /// Show the next pane tab in the focused pane. Default: "prefix+period".
+    pub next_pane_tab: BindingConfig,
+    /// Show the previous pane tab in the focused pane. Default: "prefix+comma".
+    pub previous_pane_tab: BindingConfig,
     /// Split pane vertically (side by side). Default: "prefix+v"
     pub split_vertical: BindingConfig,
     /// Split pane horizontally (stacked). Default: "prefix+minus"
@@ -572,6 +578,12 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    new_pane_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_pane_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_pane_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     split_vertical: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     split_horizontal: Option<BindingConfig>,
@@ -693,6 +705,9 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(cycle_pane_next);
         apply_field!(cycle_pane_previous);
         apply_field!(last_pane);
+        apply_field!(new_pane_tab);
+        apply_field!(next_pane_tab);
+        apply_field!(previous_pane_tab);
         apply_field!(split_vertical);
         apply_field!(split_horizontal);
         apply_field!(close_pane);
@@ -798,6 +813,9 @@ impl KeysConfig {
         copy_effective_action_field!(cycle_pane_next, keybinds.cycle_pane_next);
         copy_effective_action_field!(cycle_pane_previous, keybinds.cycle_pane_previous);
         copy_effective_action_field!(last_pane, keybinds.last_pane);
+        copy_effective_action_field!(new_pane_tab, keybinds.new_pane_tab);
+        copy_effective_action_field!(next_pane_tab, keybinds.next_pane_tab);
+        copy_effective_action_field!(previous_pane_tab, keybinds.previous_pane_tab);
         copy_effective_action_field!(split_vertical, keybinds.split_vertical);
         copy_effective_action_field!(split_horizontal, keybinds.split_horizontal);
         copy_effective_action_field!(close_pane, keybinds.close_pane);
@@ -934,6 +952,20 @@ impl<'de> Deserialize<'de> for PaneBordersConfig {
     }
 }
 
+pub const DEFAULT_PANE_TAB_MIN_WIDTH: u16 = 5;
+const PANE_TAB_MIN_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 3..=40;
+
+impl UiConfig {
+    /// `pane_tab_min_width` clamped to a range that keeps labels readable
+    /// without letting one tab take over the border.
+    pub fn effective_pane_tab_min_width(&self) -> u16 {
+        self.pane_tab_min_width.clamp(
+            *PANE_TAB_MIN_WIDTH_RANGE.start(),
+            *PANE_TAB_MIN_WIDTH_RANGE.end(),
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -980,6 +1012,9 @@ pub struct UiConfig {
     pub pane_gaps: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
+    /// Minimum width, in columns, of each pane tab label in a pane's border.
+    /// Clamped to 3..=40. Default: 5.
+    pub pane_tab_min_width: u16,
     /// Hide the tab row when the workspace has one tab. Default: false.
     pub hide_tab_bar_when_single_tab: bool,
     /// Desktop tab row placement. Default: top.
@@ -1167,6 +1202,9 @@ impl Default for KeysConfig {
             cycle_pane_next: BindingConfig::one("prefix+tab"),
             cycle_pane_previous: BindingConfig::one("prefix+shift+tab"),
             last_pane: BindingConfig::empty(),
+            new_pane_tab: BindingConfig::one("prefix+t"),
+            next_pane_tab: BindingConfig::one("prefix+period"),
+            previous_pane_tab: BindingConfig::one("prefix+comma"),
             split_vertical: BindingConfig::one("prefix+v"),
             split_horizontal: BindingConfig::one("prefix+minus"),
             close_pane: BindingConfig::one("prefix+x"),
@@ -1215,6 +1253,7 @@ impl Default for UiConfig {
             pane_scrollbars: true,
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
+            pane_tab_min_width: DEFAULT_PANE_TAB_MIN_WIDTH,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_right: Vec::new(),
@@ -1423,6 +1462,16 @@ new_cwd = "~/Projects"
             config.terminal.new_cwd,
             NewTerminalCwdConfig::Path("~/Projects".into())
         );
+    }
+
+    #[test]
+    fn pane_tab_min_width_defaults_parses_and_clamps() {
+        assert_eq!(Config::default().ui.effective_pane_tab_min_width(), 5);
+        for (value, expected) in [(14, 14), (0, 3), (500, 40)] {
+            let config: Config =
+                toml::from_str(&format!("[ui]\npane_tab_min_width = {value}\n")).unwrap();
+            assert_eq!(config.ui.effective_pane_tab_min_width(), expected);
+        }
     }
 
     #[test]

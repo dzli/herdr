@@ -776,6 +776,24 @@
           "description": "Focus the last focused pane across workspaces and tabs. Unset by default."
         },
         {
+          "key": "keys.new_pane_tab",
+          "type": "keybinding",
+          "default": "\"prefix+t\"",
+          "description": "Open a new shell as a pane tab in the focused pane."
+        },
+        {
+          "key": "keys.next_pane_tab",
+          "type": "keybinding",
+          "default": "\"prefix+period\"",
+          "description": "Show the next pane tab in the focused pane."
+        },
+        {
+          "key": "keys.previous_pane_tab",
+          "type": "keybinding",
+          "default": "\"prefix+comma\"",
+          "description": "Show the previous pane tab in the focused pane."
+        },
+        {
           "key": "keys.split_vertical",
           "type": "keybinding",
           "default": "\"prefix+v\"",
@@ -992,6 +1010,12 @@
           "type": "boolean",
           "default": "false",
           "description": "Show agent labels in split pane borders when no manual pane label is set."
+        },
+        {
+          "key": "ui.pane_tab_min_width",
+          "type": "integer",
+          "default": "5",
+          "description": "Minimum width, in columns, of each pane tab label in a pane's border. Clamped to 3-40."
         },
         {
           "key": "ui.hide_tab_bar_when_single_tab",

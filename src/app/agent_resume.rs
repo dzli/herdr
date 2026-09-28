@@ -173,6 +173,21 @@ impl App {
             }
         }
 
+        // Hidden pane tabs resume at their stack's visible geometry.
+        let mut hidden_infos = Vec::new();
+        for info in &pane_infos {
+            let Some(stack) = tab.layout.pane_stack(info.id) else {
+                continue;
+            };
+            for &member in stack.iter().filter(|member| **member != info.id) {
+                let mut hidden = info.clone();
+                hidden.id = member;
+                hidden.is_focused = false;
+                hidden_infos.push(hidden);
+            }
+        }
+        pane_infos.extend(hidden_infos);
+
         pane_infos
     }
 

@@ -81,9 +81,15 @@ pub enum Node {
 }
 
 /// BSP tiling layout. Tracks a tree of splits and a focused pane.
+///
+/// A leaf can hold a stack of panes (pane tabs). The tree stores only the
+/// visible member of each stack; `stacks` records the full membership in tab
+/// order. Every stack has at least two members, exactly one of which is a tree
+/// leaf, and focus always names a visible pane.
 pub struct TileLayout {
     root: Node,
     focus: PaneId,
+    stacks: Vec<Vec<PaneId>>,
     /// Pane focused before `focus`, used by `close_focused`. Only a real focus
     /// move writes it; tree edits go through the target-taking primitives
     /// (`split_pane`, `close_pane`, unfocused `insert_pane_near`) so internal
@@ -100,6 +106,7 @@ impl TileLayout {
             Self {
                 root: Node::Pane(root_id),
                 focus: root_id,
+                stacks: Vec::new(),
                 prev_focus: None,
             },
             root_id,
@@ -118,8 +125,141 @@ impl TileLayout {
         self.focus
     }
 
+    /// Number of panes in this layout, including hidden stack members.
     pub fn pane_count(&self) -> usize {
         count_panes(&self.root)
+            + self
+                .stacks
+                .iter()
+                .map(|stack| stack.len().saturating_sub(1))
+                .sum::<usize>()
+    }
+
+    /// Panes currently shown in the tree, one per leaf.
+    pub fn visible_pane_ids(&self) -> Vec<PaneId> {
+        let mut ids = Vec::new();
+        collect_ids(&self.root, &mut ids);
+        ids
+    }
+
+    /// Whether `id` is shown in the tree (not a hidden stack member).
+    pub fn is_pane_visible(&self, id: PaneId) -> bool {
+        contains_leaf(&self.root, id)
+    }
+
+    /// The stack containing `id`, in tab order. None when the pane is alone in
+    /// its leaf or not in this layout.
+    pub fn pane_stack(&self, id: PaneId) -> Option<&[PaneId]> {
+        self.stack_index(id).map(|idx| self.stacks[idx].as_slice())
+    }
+
+    /// All pane stacks, in tab order.
+    pub fn stacks(&self) -> &[Vec<PaneId>] {
+        &self.stacks
+    }
+
+    fn stack_index(&self, id: PaneId) -> Option<usize> {
+        self.stacks.iter().position(|stack| stack.contains(&id))
+    }
+
+    /// The tree leaf that represents `id`: the pane itself when visible,
+    /// otherwise the visible member of its stack.
+    pub fn visible_pane_for(&self, id: PaneId) -> Option<PaneId> {
+        self.visible_member(id)
+    }
+
+    fn visible_member(&self, id: PaneId) -> Option<PaneId> {
+        if self.is_pane_visible(id) {
+            return Some(id);
+        }
+        self.pane_stack(id)?
+            .iter()
+            .copied()
+            .find(|member| self.is_pane_visible(*member))
+    }
+
+    /// Add a new pane to `target`'s stack, directly after `target`. When
+    /// `show` is set the new pane becomes the visible member and inherits focus
+    /// if the stack was focused. Returns None when `target` is not in the layout.
+    pub fn add_to_stack(&mut self, target: PaneId, show: bool) -> Option<PaneId> {
+        if !self.pane_ids().contains(&target) {
+            return None;
+        }
+        let new_id = PaneId::alloc();
+        match self.stack_index(target) {
+            Some(idx) => {
+                let stack = &mut self.stacks[idx];
+                let pos = stack.iter().position(|id| *id == target)?;
+                stack.insert(pos + 1, new_id);
+            }
+            None => self.stacks.push(vec![target, new_id]),
+        }
+        if show {
+            self.select_stack_pane(new_id);
+        }
+        Some(new_id)
+    }
+
+    /// Make `id` the visible member of its stack. Focus follows when the
+    /// previously visible member was focused. Returns true when the visible
+    /// member changed.
+    pub fn select_stack_pane(&mut self, id: PaneId) -> bool {
+        let Some(leaf) = self.visible_member(id) else {
+            return false;
+        };
+        if leaf == id || !replace_leaf(&mut self.root, leaf, id) {
+            return false;
+        }
+        if self.focus == leaf {
+            self.focus = id;
+        }
+        true
+    }
+
+    /// Show the next (or previous) member of `id`'s stack, wrapping around.
+    /// Returns the newly visible pane.
+    pub fn cycle_stack(&mut self, id: PaneId, forward: bool) -> Option<PaneId> {
+        let stack = self.pane_stack(id)?;
+        let visible = self.visible_member(id)?;
+        let pos = stack.iter().position(|member| *member == visible)?;
+        let len = stack.len();
+        let next = if forward {
+            stack[(pos + 1) % len]
+        } else {
+            stack[(pos + len - 1) % len]
+        };
+        self.select_stack_pane(next).then_some(next)
+    }
+
+    /// Remove `id` from its stack. A visible member is replaced by its right
+    /// neighbor (or left, at the end), which also takes over focus.
+    fn remove_from_stack(&mut self, id: PaneId) -> bool {
+        let Some(idx) = self.stack_index(id) else {
+            return false;
+        };
+        let was_visible = self.is_pane_visible(id);
+        let stack = &mut self.stacks[idx];
+        let Some(pos) = stack.iter().position(|member| *member == id) else {
+            return false;
+        };
+        stack.remove(pos);
+        let Some(&replacement) = stack.get(pos).or_else(|| stack.last()) else {
+            self.stacks.remove(idx);
+            return false;
+        };
+        if stack.len() < 2 {
+            self.stacks.remove(idx);
+        }
+        if was_visible {
+            replace_leaf(&mut self.root, id, replacement);
+            if self.focus == id {
+                self.focus = replacement;
+            }
+        }
+        if self.prev_focus == Some(id) {
+            self.prev_focus = None;
+        }
+        true
     }
 
     /// Compute rects for all panes given the available area.
@@ -162,9 +302,10 @@ impl TileLayout {
         direction: Direction,
         ratio: f32,
     ) -> Option<PaneId> {
-        let node = find_pane_mut(&mut self.root, target)?;
+        let leaf = self.visible_member(target)?;
+        let node = find_pane_mut(&mut self.root, leaf)?;
         let new_id = PaneId::alloc();
-        *node = split_node(target, direction, new_id, valid_split_ratio(ratio));
+        *node = split_node(leaf, direction, new_id, valid_split_ratio(ratio));
         Some(new_id)
     }
 
@@ -186,10 +327,13 @@ impl TileLayout {
         if ids.contains(&moved) {
             return false;
         }
-        let Some(node) = find_pane_mut(&mut self.root, target) else {
+        let Some(leaf) = self.visible_member(target) else {
             return false;
         };
-        *node = split_node(target, direction, moved, valid_split_ratio(ratio));
+        let Some(node) = find_pane_mut(&mut self.root, leaf) else {
+            return false;
+        };
+        *node = split_node(leaf, direction, moved, valid_split_ratio(ratio));
         if focus {
             self.set_focus(moved);
         }
@@ -203,8 +347,16 @@ impl TileLayout {
             return false;
         }
         let target = self.focus;
-        let ids = self.pane_ids();
-        let pos = ids.iter().position(|id| *id == target).unwrap();
+        if self.stack_index(target).is_some() {
+            return self.remove_from_stack(target);
+        }
+        let ids = self.visible_pane_ids();
+        if ids.len() <= 1 {
+            return false;
+        }
+        let Some(pos) = ids.iter().position(|id| *id == target) else {
+            return false;
+        };
         let ordered = if pos + 1 < ids.len() {
             ids[pos + 1]
         } else {
@@ -235,6 +387,9 @@ impl TileLayout {
         if self.pane_count() <= 1 || !self.pane_ids().contains(&id) {
             return false;
         }
+        if self.stack_index(id).is_some() {
+            return self.remove_from_stack(id);
+        }
         let placeholder = PaneId::from_raw(0);
         let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
         let Some(new_root) = remove_pane(old, id) else {
@@ -247,19 +402,22 @@ impl TileLayout {
         true
     }
 
+    /// Focus `id`, first revealing it when it is a hidden stack member.
     pub fn focus_pane(&mut self, id: PaneId) {
         if self.pane_ids().contains(&id) {
+            self.select_stack_pane(id);
             self.set_focus(id);
         }
     }
 
     /// Swap two pane ids in the layout tree while preserving split shape and
-    /// ratios. Returns true only when both panes exist and are different.
+    /// ratios. Returns true only when both panes are visible and different.
+    /// Stacks move with their visible member.
     pub fn swap_panes(&mut self, first: PaneId, second: PaneId) -> bool {
         if first == second {
             return false;
         }
-        let ids = self.pane_ids();
+        let ids = self.visible_pane_ids();
         if !ids.contains(&first) || !ids.contains(&second) {
             return false;
         }
@@ -307,20 +465,27 @@ impl TileLayout {
         delta: f32,
         area: Rect,
     ) -> bool {
-        if !self.pane_ids().contains(&pane_id) {
+        let Some(leaf) = self.visible_member(pane_id) else {
             return false;
-        }
+        };
         let before = split_ratios(&self.root);
         let previous_focus = self.focus;
-        self.focus = pane_id;
+        self.focus = leaf;
         self.resize_focused(nav, delta, area);
         self.focus = previous_focus;
         split_ratios(&self.root) != before
     }
 
+    /// Every pane in this layout, including hidden stack members. Each leaf
+    /// contributes its stack members in tab order.
     pub fn pane_ids(&self) -> Vec<PaneId> {
         let mut ids = Vec::new();
-        collect_ids(&self.root, &mut ids);
+        for leaf in self.visible_pane_ids() {
+            match self.pane_stack(leaf) {
+                Some(stack) => ids.extend_from_slice(stack),
+                None => ids.push(leaf),
+            }
+        }
         ids
     }
 
@@ -330,13 +495,41 @@ impl TileLayout {
     }
 
     /// Reconstruct a layout from a saved tree.
-    /// Reconstruct a layout from a saved tree.
     pub fn from_saved(root: Node, focus: PaneId) -> Self {
         Self {
             root,
             focus,
+            stacks: Vec::new(),
             prev_focus: None,
         }
+    }
+
+    /// Reconstruct a layout from a saved tree plus pane stacks. Stacks that do
+    /// not contain exactly one tree leaf, or that reuse a pane, are dropped.
+    pub fn from_saved_with_stacks(root: Node, focus: PaneId, stacks: Vec<Vec<PaneId>>) -> Self {
+        let mut layout = Self::from_saved(root, focus);
+        let mut seen: std::collections::HashSet<PaneId> =
+            layout.visible_pane_ids().into_iter().collect();
+        for stack in stacks {
+            if stack.len() < 2 {
+                continue;
+            }
+            let leaves = stack
+                .iter()
+                .filter(|id| layout.is_pane_visible(**id))
+                .count();
+            let unique: std::collections::HashSet<PaneId> = stack.iter().copied().collect();
+            let hidden_fresh = stack
+                .iter()
+                .filter(|id| !layout.is_pane_visible(**id))
+                .all(|id| !seen.contains(id));
+            if leaves != 1 || unique.len() != stack.len() || !hidden_fresh {
+                continue;
+            }
+            seen.extend(stack.iter().copied());
+            layout.stacks.push(stack);
+        }
+        layout
     }
 }
 
@@ -580,6 +773,25 @@ fn swap_pane_ids(node: &mut Node, first: PaneId, second: PaneId) {
             swap_pane_ids(first_child, first, second);
             swap_pane_ids(second_child, first, second);
         }
+    }
+}
+
+fn contains_leaf(node: &Node, target: PaneId) -> bool {
+    match node {
+        Node::Pane(id) => *id == target,
+        Node::Split { first, second, .. } => {
+            contains_leaf(first, target) || contains_leaf(second, target)
+        }
+    }
+}
+
+fn replace_leaf(node: &mut Node, old: PaneId, new: PaneId) -> bool {
+    match find_pane_mut(node, old) {
+        Some(Node::Pane(id)) => {
+            *id = new;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1290,5 +1502,207 @@ mod tests {
         assert_eq!(layout.focused(), pane(4));
         assert!(layout.close_focused());
         assert_eq!(layout.focused(), pane(2));
+    }
+
+    // Fixed ids far above anything `PaneId::alloc` hands out in a test run, so
+    // allocated stack members never collide with them.
+    const STACK_A: u32 = 4_000_000_001;
+    const STACK_B: u32 = 4_000_000_002;
+    const STACK_C: u32 = 4_000_000_003;
+    const STACK_D: u32 = 4_000_000_004;
+    const STACK_E: u32 = 4_000_000_005;
+
+    fn two_pane_layout() -> TileLayout {
+        TileLayout::from_saved(
+            split_node(pane(STACK_A), Direction::Horizontal, pane(STACK_B), 0.5),
+            pane(STACK_A),
+        )
+    }
+
+    #[test]
+    fn add_to_stack_shows_new_pane_in_same_rect_and_moves_focus() {
+        let mut layout = two_pane_layout();
+        let area = Rect::new(0, 0, 100, 20);
+        let before: Vec<_> = layout.panes(area).iter().map(|p| p.rect).collect();
+
+        let new_id = layout
+            .add_to_stack(pane(STACK_A), true)
+            .expect("target exists");
+
+        let after = layout.panes(area);
+        assert_eq!(after.iter().map(|p| p.rect).collect::<Vec<_>>(), before);
+        assert_eq!(after[0].id, new_id);
+        assert_eq!(layout.focused(), new_id);
+        assert_eq!(layout.pane_count(), 3);
+        assert_eq!(
+            layout.pane_ids(),
+            vec![pane(STACK_A), new_id, pane(STACK_B)]
+        );
+        assert_eq!(layout.visible_pane_ids(), vec![new_id, pane(STACK_B)]);
+        assert!(!layout.is_pane_visible(pane(STACK_A)));
+        assert_eq!(
+            layout.pane_stack(pane(STACK_A)),
+            Some(&[pane(STACK_A), new_id][..])
+        );
+    }
+
+    #[test]
+    fn add_to_unfocused_stack_hidden_keeps_visible_member_and_focus() {
+        let mut layout = two_pane_layout();
+        let new_id = layout
+            .add_to_stack(pane(STACK_B), false)
+            .expect("target exists");
+
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert!(layout.is_pane_visible(pane(STACK_B)));
+        assert!(!layout.is_pane_visible(new_id));
+    }
+
+    #[test]
+    fn cycle_stack_wraps_and_focus_follows_visible_member() {
+        let mut layout = two_pane_layout();
+        let second = layout.add_to_stack(pane(STACK_A), true).unwrap();
+        let third = layout.add_to_stack(second, true).unwrap();
+        assert_eq!(
+            layout.pane_stack(pane(STACK_A)),
+            Some(&[pane(STACK_A), second, third][..])
+        );
+
+        assert_eq!(layout.cycle_stack(third, true), Some(pane(STACK_A)));
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert_eq!(layout.cycle_stack(pane(STACK_A), false), Some(third));
+        assert_eq!(layout.focused(), third);
+        assert_eq!(layout.cycle_stack(pane(STACK_B), true), None);
+    }
+
+    #[test]
+    fn cycle_unfocused_stack_leaves_focus_alone() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_B), false).unwrap();
+
+        assert_eq!(layout.cycle_stack(pane(STACK_B), true), Some(hidden));
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert!(layout.is_pane_visible(hidden));
+    }
+
+    #[test]
+    fn closing_visible_stack_member_reveals_neighbor_and_keeps_leaf() {
+        let mut layout = two_pane_layout();
+        let second = layout.add_to_stack(pane(STACK_A), true).unwrap();
+        let third = layout.add_to_stack(second, true).unwrap();
+        layout.select_stack_pane(second);
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), third);
+        assert_eq!(layout.visible_pane_ids(), vec![third, pane(STACK_B)]);
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert_eq!(layout.pane_stack(pane(STACK_A)), None);
+        assert_eq!(layout.pane_ids(), vec![pane(STACK_A), pane(STACK_B)]);
+    }
+
+    #[test]
+    fn closing_hidden_stack_member_keeps_visible_member_and_focus() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_A), false).unwrap();
+
+        assert!(layout.close_pane(hidden));
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert_eq!(layout.pane_ids(), vec![pane(STACK_A), pane(STACK_B)]);
+        assert!(layout.stacks().is_empty());
+    }
+
+    #[test]
+    fn stack_in_only_leaf_can_close_members_until_one_remains() {
+        let (mut layout, root) = TileLayout::new();
+        let tab = layout.add_to_stack(root, true).unwrap();
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), root);
+        assert!(!layout.close_focused());
+        assert_eq!(layout.pane_count(), 1);
+        let _ = tab;
+    }
+
+    #[test]
+    fn focusing_hidden_pane_reveals_it() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_B), false).unwrap();
+
+        layout.focus_pane(hidden);
+
+        assert_eq!(layout.focused(), hidden);
+        assert!(layout.is_pane_visible(hidden));
+        assert!(!layout.is_pane_visible(pane(STACK_B)));
+    }
+
+    #[test]
+    fn splitting_hidden_member_splits_its_visible_leaf() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_A), false).unwrap();
+
+        let new_id = layout
+            .split_pane(hidden, Direction::Vertical, 0.5)
+            .expect("stack is in layout");
+
+        assert_eq!(
+            layout.visible_pane_ids(),
+            vec![pane(STACK_A), new_id, pane(STACK_B)]
+        );
+        assert_eq!(
+            layout.pane_stack(pane(STACK_A)),
+            Some(&[pane(STACK_A), hidden][..])
+        );
+    }
+
+    #[test]
+    fn swapping_moves_stack_with_visible_member_and_rejects_hidden() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_A), false).unwrap();
+
+        assert!(!layout.swap_panes(hidden, pane(STACK_B)));
+        assert!(layout.swap_panes(pane(STACK_A), pane(STACK_B)));
+        assert_eq!(
+            layout.visible_pane_ids(),
+            vec![pane(STACK_B), pane(STACK_A)]
+        );
+        assert_eq!(
+            layout.pane_ids(),
+            vec![pane(STACK_B), pane(STACK_A), hidden]
+        );
+    }
+
+    #[test]
+    fn closing_last_visible_leaf_with_stack_elsewhere_uses_visible_focus() {
+        let mut layout = two_pane_layout();
+        let hidden = layout.add_to_stack(pane(STACK_A), false).unwrap();
+        layout.focus_pane(pane(STACK_B));
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(STACK_A));
+        assert_eq!(layout.pane_ids(), vec![pane(STACK_A), hidden]);
+    }
+
+    #[test]
+    fn from_saved_with_stacks_drops_invalid_stacks() {
+        let root = split_node(pane(STACK_A), Direction::Horizontal, pane(STACK_B), 0.5);
+        let layout = TileLayout::from_saved_with_stacks(
+            root,
+            pane(STACK_A),
+            vec![
+                vec![pane(STACK_A), pane(STACK_C)],
+                vec![pane(STACK_D), pane(STACK_E)],
+                vec![pane(STACK_B), pane(STACK_A)],
+                vec![pane(STACK_B), pane(STACK_C)],
+                vec![pane(STACK_B)],
+            ],
+        );
+
+        assert_eq!(layout.stacks(), &[vec![pane(STACK_A), pane(STACK_C)]]);
+        assert_eq!(
+            layout.pane_ids(),
+            vec![pane(STACK_A), pane(STACK_C), pane(STACK_B)]
+        );
     }
 }

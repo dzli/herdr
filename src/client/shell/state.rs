@@ -522,6 +522,7 @@ pub(super) enum ClientContextMenuAction {
     SwapWithFocusedPane,
     SplitRight,
     SplitDown,
+    NewPaneTab,
     Zoom,
     ToggleRightClickPassthrough,
     ClosePane,
@@ -546,6 +547,7 @@ pub(super) enum ClientContextMenuTarget {
         source_pane_id: Option<String>,
         has_manual_label: bool,
         right_click_passthrough: bool,
+        pane_tabs_supported: bool,
     },
 }
 
@@ -753,6 +755,15 @@ pub(super) struct ClientInputContext {
 
 type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, ClientInputTarget>;
 
+/// A left press on a pane's top border. Released in place, it selects the
+/// pane tab whose label is under the pointer.
+#[derive(Clone)]
+pub(super) struct ClientPaneTabPress {
+    pub(super) pane_id: String,
+    pub(super) point: (u16, u16),
+    pub(super) column: u16,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ClientPaneClick {
     pub(super) pane_id: String,
@@ -898,6 +909,7 @@ pub(crate) struct ClientShellState {
     pub(super) replaying_url_click: bool,
     pub(super) selection: Option<crate::selection::Selection<String>>,
     pub(super) last_pane_click: Option<ClientPaneClick>,
+    pub(super) pane_tab_press: Option<ClientPaneTabPress>,
     pub(super) selection_autoscroll: Option<ClientSelectionAutoscroll>,
     pub(super) selection_autoscroll_deadline: Option<std::time::Instant>,
     pub(super) selection_highlight_clear_deadline: Option<std::time::Instant>,
@@ -1063,6 +1075,7 @@ impl ClientShellState {
             replaying_url_click: false,
             selection: None,
             last_pane_click: None,
+            pane_tab_press: None,
             selection_autoscroll: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
